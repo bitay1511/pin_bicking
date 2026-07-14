@@ -1,0 +1,758 @@
+--- 
+
++++ 
+
+@@ -87,28 +87,107 @@
+
+ def estimate_pose_with_pca(point_cloud) -> PoseEstimation:
+-    """Ước lượng tư thế object bằng PCA (3D đầy đủ)"""
+-    if len(point_cloud.points) < 3:
++    """Ước lượng tư thế object bằng PCA và Bounding Box Địa Phương (Lọc Lớp Top Tuyệt Đối)"""
++    points = np.asarray(point_cloud.points)
++    
++    if len(points) < 10:
+         return None
+-    
+-    points = np.asarray(point_cloud.points)
+-    center = np.mean(points, axis=0)
+-    centered_points = points - center
+-    eigenvalues, eigenvectors = numpy_pca(centered_points)
+-
+-    x_axis = eigenvectors[:, 0]
+-    y_axis = eigenvectors[:, 1]
+-    z_axis = eigenvectors[:, 2]
+-
+-    # Chuẩn hóa
+-    x_axis = x_axis / (np.linalg.norm(x_axis) + 1e-12)
+-    y_axis = y_axis / (np.linalg.norm(y_axis) + 1e-12)
+-    z_axis = z_axis / (np.linalg.norm(z_axis) + 1e-12)
+-
+-    # Bảo đảm tay phải
+-    if np.dot(np.cross(x_axis, y_axis), z_axis) < 0:
+-        z_axis = -z_axis
+-
+-    axes = np.stack([x_axis, y_axis, z_axis], axis=1)
+-    rotation_matrix = axes
+-    
+-    return PoseEstimation(center, axes, rotation_matrix)
++        
++    # --- BƯỚC 1: LỌC BỎ MẶT HÔNG BẰNG RANSAC ---
++    # Do góc chụp nghiêng, camera thấy cả mặt Top và mặt hông. 
++    # PCA trên toàn bộ khối sẽ bị kéo lệch ~20 độ. RANSAC lấy chính xác mặt phẳng lớn nhất (mặt Top).
++    if hasattr(point_cloud, "segment_plane"):
++        try:
++            plane_model, inliers = point_cloud.segment_plane(distance_threshold=0.005, ransac_n=3, num_iterations=150)
++            if len(inliers) >= 10:
++                points = points[inliers]
++        except Exception:
++            pass
++            
++    # 1. Tính PCA trên các điểm mặt Top để tìm ra mặt phẳng của vật thể
++    center_mean_all = np.mean(points, axis=0)
++    cov_all = np.cov((points - center_mean_all).T)
++    eigenvalues, eigenvectors = np.linalg.eigh(cov_all)
++    idx = np.argsort(eigenvalues)[::-1]
++    rotation_matrix = eigenvectors[:, idx]
++    
++    # 2. Đảm bảo trục Z (pháp tuyến) luôn hướng về phía camera
++    vector_to_camera = -center_mean_all
++    if np.dot(rotation_matrix[:, 2], vector_to_camera) < 0:
++        rotation_matrix[:, 2] = -rotation_matrix[:, 2]
++        rotation_matrix[:, 1] = -rotation_matrix[:, 1]
++        
++    # 3. CHIẾU ĐIỂM VÀO KHÔNG GIAN PCA ĐỊA PHƯƠNG
++    # LƯU Ý QUAN TRỌNG: Trục Z của camera KHÔNG PHẢI là chiều dày của phôi nếu camera bị đặt nghiêng!
++    # Trục Z của PCA (Z_proj) mới chính xác là chiều cao vuông góc với mặt phôi!
++    projected = points @ rotation_matrix
++    
++    # 4. TÌM VÀ CẮT LỚP MẶT TOP BẰNG Z ĐỊA PHƯƠNG (Không dùng Z camera)
++    # Tìm đỉnh cao nhất của phôi (bỏ qua noise bằng bách phân vị 95)
++    z_top = np.percentile(projected[:, 2], 95)
++    
++    # Chỉ lấy lớp mỏng 8mm trên cùng của phôi. Nhát cắt này song song hoàn hảo với mặt phôi!
++    # Lớp mỏng này đảm bảo vứt bỏ 100% cục xốp nền ở dưới, chỉ còn lại đúng cái nắp của phôi Đỏ
++    top_mask = projected[:, 2] >= (z_top - 0.008)
++    top_points_proj = projected[top_mask]
++    
++    if len(top_points_proj) < 10:
++        top_points_proj = projected
++        
++    # 5. TÍNH TÂM HÌNH HỌC TỪ BOUNDING BOX (CHÍNH XÁC NHẤT)
++    # Dùng minAreaRect để lấy chính xác tâm của hcn bao quanh phôi, 
++    # giúp tránh bị lệch tâm khi đám mây điểm (point cloud) bị thiếu một phần.
++    points_2d = np.float32(top_points_proj[:, :2])
++    rect = cv2.minAreaRect(points_2d)
++    (cx_rect, cy_rect), (width, height), angle = rect
++    
++    cx_proj = cx_rect
++    cy_proj = cy_rect
++    cz_proj = z_top
++    
++    center_projected = np.array([cx_proj, cy_proj, cz_proj])
++    center = center_projected @ np.linalg.inv(rotation_matrix)
++    
++    # 6. --- THỐNG NHẤT TỌA ĐỘ VÀ CĂN CHỈNH THEO CẠNH PHÔI (KHẮC PHỤC LỖI RZ) ---
++    # Đảm bảo ma trận PCA ban đầu thuận tay phải (lật Y nếu cần, giữ nguyên Z hướng về cam)
++    if np.linalg.det(rotation_matrix) < 0:
++        rotation_matrix[:, 1] = -rotation_matrix[:, 1]
++        
++    # Lấy 4 góc của Bounding Box để tính toán cạnh dài/ngắn
++    box = cv2.boxPoints(rect)
++    
++    # 2 vector đại diện cho 2 cạnh góc vuông của phôi
++    edge1 = box[1] - box[0]
++    edge2 = box[2] - box[1]
++    
++    len1 = np.linalg.norm(edge1)
++    len2 = np.linalg.norm(edge2)
++    
++    # THỐNG NHẤT TỌA ĐỘ: Trục X luôn nằm dọc theo CẠNH DÀI NHẤT của phôi.
++    # Nhờ vậy, khi bạn xoay phôi 90 độ, trục X cũng sẽ xoay đúng 90 độ theo phôi.
++    if len1 > len2:
++        dir_x = edge1 / len1
++    else:
++        dir_x = edge2 / len2
++        
++    # Map vector này về không gian Camera để chọn chiều dương (tránh lật 180 độ lung tung)
++    v_cam = rotation_matrix @ np.array([dir_x[0], dir_x[1], 0])
++    
++    # Quy ước cơ bản: Trục X luôn hướng về nửa phải của camera
++    # (Thuật toán tối ưu 180 độ ở phía sau sẽ tự động lật lại nếu cần thiết)
++    if v_cam[0] < 0:
++        dir_x = -dir_x
++        
++    # Tính trục Y vuông góc với trục X (thuận tay phải)
++    dir_y = np.array([-dir_x[1], dir_x[0]])
++    
++    # Ma trận xoay chuẩn góc 2D
++    R_local = np.array([
++        [dir_x[0], dir_y[0], 0],
++        [dir_x[1], dir_y[1], 0],
++        [0, 0, 1]
++    ])
++    
++    # Cập nhật hệ trục tọa độ cuối cùng, hoàn hảo căn lề theo mép phôi
++    rotation_matrix = rotation_matrix @ R_local
++        
++    return PoseEstimation(center=center, rotation_matrix=rotation_matrix, axes=rotation_matrix)
+ 
+@@ -174,4 +253,6 @@
+
+     if len(pcd.points) > 0:
+-        pcd.estimate_normals()
+-        pcd.normalize_normals()
++        # TẮT TÍNH TOÁN NORMALS ĐỂ HẾT LAG
++        # pcd.estimate_normals()
++        # pcd.normalize_normals()
++        pass
+     return pcd
+@@ -325,3 +406,3 @@
+
+         self.grasp_type = "center"
+-        self.tool = 1
++        self.tool = 2
+         self.user = 0
+@@ -337,3 +418,7 @@
+
+         # Vị trí chụp (original) mặc định như ảnh: đơn vị mm, deg (X Y Z RX RY RZ)
+-        self.capture_pose = [-197.681,-345.429, 380.374, 4.427, -0.195, -44.113]
++        self.capture_pose = [-165.283, -320.325, 300.315, 0.138, 0.799, 90.030]
++        
++        # Biến lưu trữ để ổn định tọa độ (EMA Filter)
++        self.smooth_T = None
++        self.smooth_R = None
+         
+@@ -343,3 +428,3 @@
+
+         self.saved_roi = None  # Lưu ROI trước đó
+-        self.roi_strict_mode = True  # True: crop trước khi detect, False: detect toàn ảnh rồi lọc
++        self.roi_strict_mode = False  # True: crop trước khi detect, False: detect toàn ảnh rồi lọc
+         
+@@ -428,16 +513,16 @@
+
+     
+-    # Thiết lập kết nối robot với IP và các tham số tool/user
+-    # Input: ip - địa chỉ IP robot, tool - ID tool, user - ID user
+-    # Output: True nếu thành công, False nếu có lỗi
+-    def setup_robot(self, ip: str, tool: int, user: int):
+-        """Setup robot connection"""
++    def setup_robot(self, robot_instance, tool: int, user: int):
++        """Setup robot connection with an existing robot instance"""
++        if robot_instance is None:
++            self.error_occurred.emit("Vui lòng kết nối Robot trên giao diện trước khi bắt đầu!")
++            return False
++            
+         try:
+-            self.robot_ip = ip
++            self.robot = robot_instance
+             self.tool = tool
+             self.user = user
+-            self.robot = Robot.RPC(ip)
+-            self.status_update.emit("Robot connected successfully")
++            self.status_update.emit("Robot connection established in thread")
+             return True
+         except Exception as e:
+-            self.error_occurred.emit(f"Robot connection error: {str(e)}")
++            self.error_occurred.emit(f"Robot setup error in thread: {str(e)}")
+             self.robot = None
+@@ -484,3 +569,3 @@
+
+     # Tải ROI đã lưu trước đó
+-    # Input: không có
++    # Input: không c
+     # Output: True nếu có ROI đã lưu, False nếu không có
+@@ -515,4 +600,4 @@
+
+         # Log mỗi 30 frames để tránh spam
+-        if self._debug_count % 30 == 0:
+-            self.status_update.emit(f"ROI check: detection({x1:.0f},{y1:.0f},{x2:.0f},{y2:.0f}) vs ROI({roi_x1:.0f},{roi_y1:.0f},{roi_x2:.0f},{roi_y2:.0f}) = {is_inside}")
++        # if self._debug_count % 30 == 0:
++        #     self.status_update.emit(f"ROI check: detection({x1:.0f},{y1:.0f},{x2:.0f},{y2:.0f}) vs ROI({roi_x1:.0f},{roi_y1:.0f},{roi_x2:.0f},{roi_y2:.0f}) = {is_inside}")
+         
+@@ -605,3 +690,3 @@
+
+                     # Debug: Log ROI bounds
+-                    self.status_update.emit(f"ROI bounds: ({roi_x1}, {roi_y1}) to ({roi_x2}, {roi_y2})")
++                    # self.status_update.emit(f"ROI bounds: ({roi_x1}, {roi_y1}) to ({roi_x2}, {roi_y2})")
+                     
+@@ -612,3 +697,3 @@
+
+                     # YOLOv8-seg inference trên ảnh đã crop
+-                    results = self.model.predict(color_cropped, conf=self.confidence, iou=self.iou, device='cpu', verbose=False)
++                    results = self.model.predict(color_cropped, conf=self.confidence, iou=self.iou, verbose=False)
+                     
+@@ -623,8 +708,8 @@
+
+                             # Debug: Log adjusted coordinates
+-                            for i in range(len(boxes.data)):
+-                                x1, y1, x2, y2 = boxes.xyxy[i]
+-                                self.status_update.emit(f"Adjusted detection {i}: ({x1:.0f}, {y1:.0f}, {x2:.0f}, {y2:.0f})")
++                            # for i in range(len(boxes.data)):
++                            #     x1, y1, x2, y2 = boxes.xyxy[i]
++                            #     self.status_update.emit(f"Adjusted detection {i}: ({x1:.0f}, {y1:.0f}, {x2:.0f}, {y2:.0f})")
+                 else:
+                     # YOLOv8-seg inference trực tiếp trên frame BGR
+-                    results = self.model.predict(color, conf=self.confidence, iou=self.iou, device='cpu', verbose=False)
++                    results = self.model.predict(color, conf=self.confidence, iou=self.iou, verbose=False)
+                 
+@@ -656,3 +741,3 @@
+
+                             # Debug logging cho từng detection
+-                            self.status_update.emit(f"Detection {i}: class={cls}, conf={conf:.2f}, bbox=({x1:.0f},{y1:.0f},{x2:.0f},{y2:.0f}), in_roi={is_in_roi}")
++                            # self.status_update.emit(f"Detection {i}: class={cls}, conf={conf:.2f}, bbox=({x1:.0f},{y1:.0f},{x2:.0f},{y2:.0f}), in_roi={is_in_roi}")
+                             
+@@ -660,5 +745,6 @@
+
+                                 valid_list.append((i, x1, y1, x2, y2, conf, cls))
+-                                self.status_update.emit(f"✓ Accepted detection {i} (class {cls})")
++                                # self.status_update.emit(f"✓ Accepted detection {i} (class {cls})")
+                             else:
+-                                self.status_update.emit(f"✗ Rejected detection {i}: outside ROI")
++                                pass
++                                # self.status_update.emit(f"✗ Rejected detection {i}: outside ROI")
+                         
+@@ -666,3 +752,3 @@
+
+                         if valid_list:
+-                            self.status_update.emit(f"Found {len(valid_list)} valid objects")
++                            # self.status_update.emit(f"Found {len(valid_list)} valid objects")
+                             valid_list.sort(key=lambda x: (((x[1]+x[3])/2.0), ((x[2]+x[4])/2.0)))
+@@ -671,3 +757,3 @@
+
+                             valid_detections = []
+-                            self.status_update.emit("No valid objects detected")
++                            # self.status_update.emit("No valid objects detected")
+                     
+@@ -702,3 +788,3 @@
+
+                                 class_name = f"Class_{int(cls)}"
+-                        self.status_update.emit(f"Detected object: {class_name} (ID: {int(cls)}) - Confidence: {conf:.2f}")
++                        # self.status_update.emit(f"Detected object: {class_name} (ID: {int(cls)}) - Confidence: {conf:.2f}")
+                         
+@@ -730,3 +816,4 @@
+
+                             # Debug: Log khi không vẽ mask do nằm ngoài ROI
+-                            self.status_update.emit(f"⚠️ Skipping mask drawing for detection {rank}: outside ROI")
++                            # self.status_update.emit(f"⚠️ Skipping mask drawing for detection {rank}: outside ROI")
++                            pass
+ 
+@@ -736,2 +823,10 @@
+
+                             try:
++                                # Tự động xác định grasp_type theo tên class (object1 -> top, object2 -> side)
++                                current_grasp_type = self.grasp_type
++                                cls_str = class_name.lower()
++                                if cls_str == 'object1' or cls_str == 'object':
++                                    current_grasp_type = "top"
++                                elif cls_str == 'object2' or '2' in cls_str:
++                                    current_grasp_type = "side"
++
+                                 # Sử dụng mask đã được điều chỉnh cho ảnh gốc
+@@ -769,3 +864,2 @@
+
+                                             ret = self.robot.GetActualToolFlangePose()
+-                                            print("robot pose: ", ret)
+                                             if isinstance(ret, (list, tuple)) and len(ret) >= 2:
+@@ -775,3 +869,64 @@
+
+                                                 tvec = (S_conv @ pose.center.reshape(3, 1).astype(np.float64))
++                                                
++                                                # Bù trừ khoảng cách gắp (tính bằng mét) vào tvec
++                                                if grasp_offset is not None:
++                                                    tvec = tvec + R_cam_mat @ grasp_offset.reshape(3, 1)
++                                                    
+                                                 R_base_deg, T_base_mm = target_point.target_point(R_cam_mat, tvec, robot_point, self.RT)
++                                                
++                                                # --- BẮT ĐẦU: TÍNH RZ DỰA TRÊN GÓC 2D CỦA PHÔI ---
++                                                # Người dùng yêu cầu: RZ ban đầu là 90, chỉ cần xoay RZ theo tọa độ phôi
++                                                import math
++                                                
++                                                # Lấy góc 2D của trục X (trục dài nhất của phôi) trên mặt phẳng ảnh
++                                                # pose.axes[0, 0] là X, pose.axes[1, 0] là Y
++                                                angle_2d_rad = math.atan2(pose.axes[1, 0], pose.axes[0, 0])
++                                                angle_2d_deg = math.degrees(angle_2d_rad)
++                                                
++                                                # Theo yêu cầu: phôi nằm ngang (angle=0) thì gripper gắp dọc bờ phôi -> RZ phải là 0 hoặc 180
++                                                # ĐỒNG THỜI giới hạn RZ chỉ được phép nằm trong khoảng [0, 180] độ để an toàn
++                                                new_rz = angle_2d_deg % 180.0
++                                                    
++                                                # Áp dụng RZ mới
++                                                R_base_deg[2] = new_rz
++                                                # --- KẾT THÚC TÍNH RZ ---
++                                                
++                                                # --- BẮT ĐẦU: LỌC NHIỄU VÀ ỔN ĐỊNH TỌA ĐỘ CHO VẬT TOP 1 ---
++                                                if rank == 0:
++                                                    if self.smooth_T is None or self.smooth_R is None:
++                                                        self.smooth_T = T_base_mm.copy()
++                                                        self.smooth_R = R_base_deg.copy()
++                                                    else:
++                                                        dist = np.linalg.norm(T_base_mm - self.smooth_T)
++                                                        if dist > 50.0:
++                                                            # Vật khác hoặc bị xê dịch quá xa -> Reset mượt
++                                                            self.smooth_T = T_base_mm.copy()
++                                                            self.smooth_R = R_base_deg.copy()
++                                                        else:
++                                                            # 1. Làm mượt Tọa độ (Translation) bằng EMA
++                                                            alpha_t = 0.15
++                                                            self.smooth_T = alpha_t * T_base_mm + (1 - alpha_t) * self.smooth_T
++                                                            T_base_mm = self.smooth_T.copy()
++                                                            
++                                                            # 2. Làm mượt Góc quay (Rotation)
++                                                            alpha_r = 0.15
++                                                            diff = R_base_deg[2] - self.smooth_R[2]
++                                                            diff = (diff + 180) % 360 - 180
++                                                            
++                                                            # Nếu phát hiện vật xoay một góc lớn (ví dụ > 60 độ) do người dùng xoay, 
++                                                            # ta reset lại góc mượt luôn để bắt kịp nhanh thay vì làm mượt chậm
++                                                            if abs(diff) > 60:
++                                                                self.smooth_R[2] = R_base_deg[2]
++                                                            else:
++                                                                self.smooth_R[2] = self.smooth_R[2] + alpha_r * diff
++                                                            self.smooth_R[0] = alpha_r * R_base_deg[0] + (1 - alpha_r) * self.smooth_R[0]
++                                                            self.smooth_R[1] = alpha_r * R_base_deg[1] + (1 - alpha_r) * self.smooth_R[1]
++                                                            
++                                                            R_base_deg = self.smooth_R.copy()
++                                                # --- KẾT THÚC LỌC NHIỄU ---
++                                                
++                                                # Debug tọa độ base ra màn hình UI
++                                                log_msg = f">> [Class: {class_name} | Grasp: {current_grasp_type}] Tọa độ Base -> X: {T_base_mm[0]:.1f}, Y: {T_base_mm[1]:.1f}, Z: {T_base_mm[2]:.1f} | Rx: {R_base_deg[0]:.1f}, Ry: {R_base_deg[1]:.1f}, Rz: {R_base_deg[2]:.1f}"
++                                                self.status_update.emit(log_msg)
++                                                
+                                                 detected_targets_base.append((R_base_deg, T_base_mm))
+@@ -811,3 +966,4 @@
+
+                                         # Debug: Log khi không vẽ trục do nằm ngoài ROI
+-                                        self.status_update.emit(f"⚠️ Skipping axis drawing for detection {rank}: outside ROI")
++                                        # self.status_update.emit(f"⚠️ Skipping axis drawing for detection {rank}: outside ROI")
++                                        pass
+                             except Exception as e:
+@@ -816,3 +972,4 @@
+
+                             # Debug: Log khi không xử lý point cloud do nằm ngoài ROI
+-                            self.status_update.emit(f"⚠️ Skipping point cloud processing for detection {rank}: outside ROI")
++                            # self.status_update.emit(f"⚠️ Skipping point cloud processing for detection {rank}: outside ROI")
++                            pass
+                 
+@@ -823,10 +980,19 @@
+
+                             Rb, Tb = detected_targets_base[0]
+-                            desc_pos = [float(Tb[0]), float(Tb[1]), float(Tb[2]), float(Rb[0]), float(Rb[1]), float(Rb[2])]
++                            
++                            # Kiểm tra xem phôi có bị nghiêng không (ngưỡng 15 độ)
++                            TILT_THRESHOLD = 15.0
++                            rx_val = float(Rb[0]) if abs(float(Rb[0])) > TILT_THRESHOLD else 0.0
++                            ry_val = float(Rb[1]) if abs(float(Rb[1])) > TILT_THRESHOLD else 0.0
++                            
++                            desc_pos = [float(Tb[0]), float(Tb[1]), float(Tb[2]), rx_val, ry_val, float(Rb[2])]
+                             
+                             # Kiểm tra góc quay trước khi di chuyển
+-                            desc_pos_clamped, warnings = clamp_desc_pos_angles(desc_pos, max_rx=15.0, max_ry=180.0, max_rz=180.0)
++                            # desc_pos_clamped, warnings = clamp_desc_pos_angles(desc_pos, max_rx=15.0, max_ry=180.0, max_rz=180.0)
++                            desc_pos_clamped = desc_pos
++                            warnings = []
+                             
+-                            # In ra tư thế gốc và tư thế sau khi đã giới hạn
+-                            self.status_update.emit(f"Tư thế gốc: X={desc_pos[0]:.1f}, Y={desc_pos[1]:.1f}, Z={desc_pos[2]:.1f}, RX={desc_pos[3]:.1f}, RY={desc_pos[4]:.1f}, RZ={desc_pos[5]:.1f}")
+-                            self.status_update.emit(f"Tư thế MoveL (sau cưỡng bức Rx=15°): X={desc_pos_clamped[0]:.1f}, Y={desc_pos_clamped[1]:.1f}, Z={desc_pos_clamped[2]:.1f}, RX={desc_pos_clamped[3]:.1f}, RY={desc_pos_clamped[4]:.1f}, RZ={desc_pos_clamped[5]:.1f}")
++                            # In ra tư thế gốc và tư thế sau khi đã giới hạn (In ra terminal)
++                            log_msg = f"[AUTO MOVE] Tọa độ robot sẽ đến: X={desc_pos[0]:.1f}, Y={desc_pos[1]:.1f}, Z={desc_pos[2]:.1f}, RX={desc_pos[3]:.1f}, RY={desc_pos[4]:.1f}, RZ={desc_pos[5]:.1f}"
++                            print(log_msg)
++                            self.status_update.emit(log_msg)
+                             
+@@ -840,19 +1006,8 @@
+
+                                 
+-                                # _ = self.robot.MoveL(desc_pos_clamped, self.tool, self.user, vel=self.move_vel, acc=self.move_acc, offset_flag=2, offset_pos=self.offset_up)
+-                                # _ = self.robot.MoveL(desc_pos, self.tool, self.user, vel=self.move_vel, ascc=self.move_acc, offset_flag=0, offset_pos=[0,0,0,0,0,0])
++                                # Tạm thời tắt auto_move sau khi gắp 1 vật để an toàn
++                                self.auto_move = False
++                                # TẮT CAMERA VÀ THOÁT LUỒNG DETECT
++                                self.status_update.emit("Đã ra lệnh Robot di chuyển. Tạm đóng Camera để tránh nhiễu.")
++                                self.running = False
+                                 
+-
+-                                
+-                                # _ = self.robot.MoveL(desc_pos_clamped, self.tool, self.user, vel=self.move_vel, acc=self.move_acc, offset_flag=2, offset_pos=self.offset_down)
+-                                # _ = self.robot.MoveL(desc_pos_clamped, self.tool, self.user, vel=self.move_vel, acc=self.move_acc, offset_flag=2, offset_pos=self.offset_up1)
+-                                # Xoay bút về góc chuẩn nhưng giữ vị trí hiện tại (sau khi lên)
+-                                # current_pose = [float(Tb[0]), float(Tb[1]), float(Tb[2]) + 200, -2.729, -0.253, -49.338]
+-                                # _ = self.robot.MoveL(current_pose, self.tool, self.user, vel=self.move_vel, acc=self.move_acc, offset_flag=0, offset_pos=[0,0,0,0,0,0])
+-                                
+-                                # # Quay về vị trí chụp để chụp tiếp vật kế tiếp
+-                                # _ = self.robot.MoveL(self.capture_pose, self.tool, self.user, vel=self.move_vel, acc=self.move_acc, offset_flag=0, offset_pos=[0,0,0,0,0,0])
+-                                self.status_update.emit("Auto Movement executed")
+-                                # Sau khi di chuyển xong, đánh dấu để tránh lặp
+-                                self.moved_recently = True
+-                                self.last_move_time = time.time()
+                             else:
+@@ -905,3 +1060,6 @@
+
+         if self.pipeline:
+-            self.pipeline.stop()
++            try:
++                self.pipeline.stop()
++            except:
++                pass
+ 
+@@ -1303,2 +1461,15 @@
+
+             }
++            QPushButton#openGripperButton {
++                background: #17a2b8;
++            }
++            QPushButton#openGripperButton:hover {
++                background: #138496;
++            }
++            QPushButton#closeGripperButton {
++                background: #ffc107;
++                color: #212529;
++            }
++            QPushButton#closeGripperButton:hover {
++                background: #e0a800;
++            }
+             QLabel {
+@@ -1428,2 +1599,18 @@
+
+         control_layout.addWidget(self.auto_move_checkbox)
++        
++        # Gripper buttons
++        gripper_layout = QHBoxLayout()
++        self.open_gripper_button = QPushButton("Mở Gripper")
++        self.open_gripper_button.setObjectName("openGripperButton")
++        self.open_gripper_button.setEnabled(False)
++        self.open_gripper_button.setMinimumHeight(35)
++        
++        self.close_gripper_button = QPushButton("Đóng Gripper")
++        self.close_gripper_button.setObjectName("closeGripperButton")
++        self.close_gripper_button.setEnabled(False)
++        self.close_gripper_button.setMinimumHeight(35)
++        
++        gripper_layout.addWidget(self.open_gripper_button)
++        gripper_layout.addWidget(self.close_gripper_button)
++        control_layout.addLayout(gripper_layout)
+         
+@@ -1478,3 +1665,2 @@
+
+         
+-        # Robot IP
+         robot_ip_layout = QHBoxLayout()
+@@ -1483,3 +1669,14 @@
+
+         robot_ip_layout.addWidget(self.robot_ip_line_edit)
++        
++        # Nút kết nối thủ công
++        self.connect_robot_button = QPushButton("Kết nối")
++        self.connect_robot_button.setStyleSheet("font-weight: bold; padding: 5px;")
++        robot_ip_layout.addWidget(self.connect_robot_button)
+         robot_layout.addLayout(robot_ip_layout)
++        
++        # Nhãn trạng thái kết nối
++        self.robot_status_label = QLabel("Chưa kết nối")
++        self.robot_status_label.setStyleSheet("color: #7f8c8d; font-weight: bold;")
++        self.robot_status_label.setAlignment(Qt.AlignCenter)
++        robot_layout.addWidget(self.robot_status_label)
+         
+@@ -1773,2 +1970,10 @@
+
+         self.move_robot_button.clicked.connect(self.move_robot)
++        self.connect_robot_button.clicked.connect(self.connect_robot_manual)
++        
++        # Gripper connections
++        self.open_gripper_button.clicked.connect(self.open_gripper)
++        self.close_gripper_button.clicked.connect(self.close_gripper)
++        
++        # Initialize robot attribute
++        self.robot = None
+         self.browse_weights_button.clicked.connect(self.browse_weights)
+@@ -1803,2 +2008,3 @@
+
+         """Start YOLO detection"""
++        self.is_detection_stopped = False
+         try:
+@@ -1824,3 +2030,2 @@
+
+             # Get robot settings
+-            robot_ip = self.robot_ip_line_edit.text()
+             tool = self.tool_spinbox.value()
+@@ -1829,2 +2034,8 @@
+
+             auto_move = self.auto_move_checkbox.isChecked()
++            
++            # Yêu cầu kết nối robot thủ công trước khi bắt đầu
++            if getattr(self, 'robot', None) is None:
++                self.show_error("Vui lòng nhấn nút 'Kết nối' ở mục Cài đặt Robot trước khi Bắt đầu!")
++                self.start_button.setEnabled(True)
++                return
+             
+@@ -1843,3 +2054,5 @@
+
+             
+-            if not self.detection_thread.setup_robot(robot_ip, tool, user):
++            if not self.detection_thread.setup_robot(self.robot, tool, user):
++                self.show_error("Không thể thiết lập robot cho luồng nhận diện!")
++                self.start_button.setEnabled(True)
+                 return
+@@ -1852,2 +2065,6 @@
+
+             self.detection_thread.auto_move = auto_move
++            
++            # Truyền ROI vào detection_thread nếu có
++            if getattr(self, 'frame_roi_rect', None) is not None:
++                self.detection_thread.set_roi(self.frame_roi_rect)
+             
+@@ -1871,2 +2088,4 @@
+
+         """Stop YOLO detection"""
++        self.is_detection_stopped = True
++        
+         if self.detection_thread:
+@@ -1875,6 +2094,20 @@
+
+             self.detection_thread = None
+-        
+-        # Khởi động lại camera timer
+-        if hasattr(self, 'camera_timer'):
+-            self.camera_timer.start(33)
++            
++        # Xóa đen màn hình camera để thể hiện là camera đã ĐÓNG
++        if hasattr(self, 'camera_label'):
++            self.camera_label.clear()
++            self.camera_label.setText("CAMERA ĐÃ ĐÓNG")
++            self.camera_label.setStyleSheet("color: red; font-size: 20px; font-weight: bold; background-color: black;")
++        if hasattr(self, 'depth_label'):
++            self.depth_label.clear()
++            self.depth_label.setText("DEPTH ĐÃ ĐÓNG")
++            self.depth_label.setStyleSheet("color: red; font-size: 20px; font-weight: bold; background-color: black;")
++            
++        # Ép UI cập nhật ngay lập tức để màn hình đổi màu đen không bị đơ
++        QApplication.processEvents()
++        
++        # CÓ TÌNH BỎ KHỞI ĐỘNG LẠI CAMERA TIMER ĐỂ MÀN HÌNH GIỮ MÀU ĐEN
++        # self.initialize_camera_for_display()
++        # if hasattr(self, 'camera_timer'):
++        #     self.camera_timer.start(33)
+         
+@@ -1887,2 +2120,57 @@
+
+     
++    def connect_robot_manual(self):
++        """Kết nối robot thủ công bằng nút nhấn"""
++        ip = self.robot_ip_line_edit.text()
++        self.robot_status_label.setText("Đang kết nối...")
++        self.robot_status_label.setStyleSheet("color: #f39c12; font-weight: bold;")
++        QApplication.processEvents()
++        
++        try:
++            self.robot = Robot.RPC(ip)
++            self.robot_status_label.setText("Kết nối thành công")
++            self.robot_status_label.setStyleSheet("color: #27ae60; font-weight: bold;")
++            self.log_message(f"Kết nối thành công tới Robot IP: {ip}")
++            if hasattr(self, 'open_gripper_button'):
++                self.open_gripper_button.setEnabled(True)
++            if hasattr(self, 'close_gripper_button'):
++                self.close_gripper_button.setEnabled(True)
++        except Exception as e:
++            self.robot_status_label.setText("Kết nối thất bại")
++            self.robot_status_label.setStyleSheet("color: #e74c3c; font-weight: bold;")
++            self.log_message(f"Lỗi kết nối Robot: {e}")
++            self.robot = None
++            if hasattr(self, 'open_gripper_button'):
++                self.open_gripper_button.setEnabled(False)
++            if hasattr(self, 'close_gripper_button'):
++                self.close_gripper_button.setEnabled(False)
++            
++    def open_gripper(self):
++        """Mở Gripper"""
++        if getattr(self, 'robot', None):
++            try:
++                # Tùy chỉnh lệnh mở gripper theo cấu hình của bạn
++                # Ví dụ lệnh MoveGripper: self.robot.MoveGripper(1, 100, 50, 50, 10000, 1, 0, 0, 0, 0)
++                # Hoặc lệnh I/O (DO): self.robot.SetDO(1, 1, 0, 0)
++                self.robot.MoveGripper(1, 0, 50, 50, 10000, 1, 0, 0, 0, 0)
++
++                self.log_message("Đã gửi lệnh Mở Gripper")
++            except Exception as e:
++                self.log_message(f"Lỗi khi mở gripper: {str(e)}")
++        else:
++            self.log_message("Vui lòng kết nối robot trước khi thao tác Gripper!")
++
++    def close_gripper(self):
++        """Đóng Gripper"""
++        if getattr(self, 'robot', None):
++            try:
++                # Tùy chỉnh lệnh đóng gripper theo cấu hình của bạn
++                # Ví dụ lệnh MoveGripper: self.robot.MoveGripper(1, 0, 50, 50, 10000, 1, 0, 0, 0, 0)
++                # Hoặc lệnh I/O (DO): self.robot.SetDO(1, 0, 0, 0)
++                self.robot.MoveGripper(1, 100, 50, 50, 10000, 1, 0, 0, 0, 0)
++                self.log_message("Đã gửi lệnh Đóng Gripper")
++            except Exception as e:
++                self.log_message(f"Lỗi khi đóng gripper: {str(e)}")
++        else:
++            self.log_message("Vui lòng kết nối robot trước khi thao tác Gripper!")
++            
+     # Di chuyển robot đến vị trí object đã detect
+@@ -1892,32 +2180,67 @@
+
+         """Move robot to detected object"""
+-        if not self.detection_thread or not self.detection_thread.robot:
+-            self.show_error("Robot not connected")
++        if not self.last_detected_targets:
++            self.log_message("No valid targets found")
+             return
+-        if not self.last_detected_targets or self.last_detected_targets[0][0] is None:
+-            self.show_error("Chưa có mục tiêu hợp lệ để di chuyển")
+-            return
++            
+         try:
++            # Lấy thông số tool và user từ giao diện
++            tool = self.tool_spinbox.value()
++            user = self.user_spinbox.value()
++            
++            # 1. Tắt camera luồng detect khi bắt đầu di chuyển
++            self.stop_detection()
++            self.log_message("Camera detection paused for movement...")
++            
++            if not getattr(self, 'robot', None):
++                self.show_error("Robot not connected")
++                return
++            
+             Rb, Tb = self.last_detected_targets[0]
+-            desc_pos = [float(Tb[0]), float(Tb[1]), float(Tb[2]), float(Rb[0]), float(Rb[1]), float(Rb[2])]
+-            
+-            # Giới hạn góc quay trước khi MoveL
+-            desc_pos_clamped, warnings = clamp_desc_pos_angles(desc_pos, max_rx=15.0, max_ry=180.0, max_rz=180.0)
+-            
+-            # In ra tư thế gốc và tư thế sau khi đã giới hạn
+-            self.log_message(f"Tư thế gốc: X={desc_pos[0]:.1f}, Y={desc_pos[1]:.1f}, Z={desc_pos[2]:.1f}, RX={desc_pos[3]:.1f}, RY={desc_pos[4]:.1f}, RZ={desc_pos[5]:.1f}")
+-            self.log_message(f"Tư thế MoveL (sau cưỡng bức Rx=15°): X={desc_pos_clamped[0]:.1f}, Y={desc_pos_clamped[1]:.1f}, Z={desc_pos_clamped[2]:.1f}, RX={desc_pos_clamped[3]:.1f}, RY={desc_pos_clamped[4]:.1f}, RZ={desc_pos_clamped[5]:.1f}")
++            
++            # CẤU HÌNH BÙ SAI LỆCH TÂM (Đơn vị: mm)
++            # Nếu robot đi xuống bị lệch X, Y cố định, điền giá trị bù vào đây (ví dụ: +5.0 hoặc -3.5)
++            CALIB_X_OFFSET = 0.0  # Bù trục X (mm)
++            CALIB_Y_OFFSET = 0.0  # Bù trục Y (mm)
++            CALIB_Z_OFFSET = 0.0  # Bù trục Z (mm)
++            
++            # Kiểm tra xem phôi có bị nghiêng hay lệch không (ngưỡng 15 độ)
++            TILT_THRESHOLD = 15.0
++            rx_val = float(Rb[0]) if abs(float(Rb[0])) > TILT_THRESHOLD else 0.0
++            ry_val = float(Rb[1]) if abs(float(Rb[1])) > TILT_THRESHOLD else 0.0
++            
++            desc_pos = [
++                float(Tb[0]) + CALIB_X_OFFSET, 
++                float(Tb[1]) + CALIB_Y_OFFSET,  
++                float(Tb[2]) + CALIB_Z_OFFSET, 
++                rx_val, 
++                ry_val, 
++                float(Rb[2])
++            ]
++            
++            # Đã bỏ giới hạn góc quay (clamping) theo yêu cầu thực tế
++            
++            # In ra tư thế gốc
++            self.log_message(f"Tư thế MoveL: X={desc_pos[0]:.1f}, Y={desc_pos[1]:.1f}, Z={desc_pos[2]:.1f}, RX={desc_pos[3]:.1f}, RY={desc_pos[4]:.1f}, RZ={desc_pos[5]:.1f}")
+             
+             # Cập nhật tọa độ hiện tại
+-            self.update_coordinates(desc_pos_clamped)
+-            
+-            for warning in warnings:
+-                self.log_message(f"MoveL WARNING: {warning}")
+-            
+-            ret1 = self.detection_thread.robot.MoveL(desc_pos_clamped, self.detection_thread.tool, self.detection_thread.user, vel=5, acc=100, offset_flag=2, offset_pos=[0,0,0,0,0,0])
+-            ret2 = self.detection_thread.robot.MoveL(desc_pos_clamped, self.detection_thread.tool, self.detection_thread.user, vel=5, acc=100, offset_flag=2, offset_pos=[0,0,-5,0,0,0])
+-            # Quay về vị trí chụp sau khi gắp xong
+-            # ret3 = self.detection_thread.robot.MoveL(self.detection_thread.capture_pose, self.detection_thread.tool, self.detection_thread.user, vel=5, acc=100, offset_flag=0, offset_pos=[0,0,0,0,0,0])
+-            self.log_message(f"Movement results: up={ret1}, down={ret2}, back_to_capture={ret3}")
++            self.update_coordinates(desc_pos)
++            
++            # Chạy lệnh MoveL trong một luồng ngầm để KHÔNG LÀM ĐƠ TERMINAL/UI
++            self.log_message(f"Đang gửi lệnh MoveL tới robot...")
++            
++            def execute_move():
++                try:
++                    ret1 = self.robot.MoveL(desc_pos, tool, user, vel=5, acc=100, offset_flag=2, offset_pos=[0,0,0,0,0,0])
++                    if ret1 == 0:
++                        print(f"[Move Robot Thread] Robot di chuyển thành công! (Mã lỗi: {ret1})")
++                    else:
++                        print(f"[Move Robot Thread] Lệnh di chuyển BỊ TỪ CHỐI! Mã lỗi: {ret1}")
++                except Exception as e:
++                    print(f"[Move Robot Thread] Lỗi khi gửi lệnh MoveL: {e}")
++                    
++            import threading
++            threading.Thread(target=execute_move, daemon=True).start()
++            
+         except Exception as e:
+-            self.show_error(f"Movement failed: {str(e)}")
++            self.show_error(f"Movement setup failed: {str(e)}")
+     
+@@ -2096,2 +2419,6 @@
+
+         """Update camera frame display"""
++        # Bỏ qua các frame rác (pending signals) gửi đến sau khi đã bấm nút Stop/Move
++        if getattr(self, 'is_detection_stopped', False):
++            return
++            
+         # Lưu mục tiêu mới nhất phục vụ nút di chuyển
+@@ -2250,4 +2577,5 @@
+
+         try:
++            roi_data = {}
+             if getattr(self, 'frame_roi_rect', None) is not None:
+-                roi_data = {"roi_rect": list(self.frame_roi_rect), "timestamp": time.time()}
++                roi_data["roi_rect"] = list(self.frame_roi_rect)
+                 with open(self.roi_config_file, 'w') as f:
+@@ -2286,14 +2614,2 @@
+
+             self.log_message(f"Failed to load ROI config: {str(e)}")
+-    
+-    def save_roi_config(self):
+-        """Lưu cấu hình ROI vào file"""
+-        try:
+-            roi_data = {}
+-            if getattr(self, 'frame_roi_rect', None) is not None:
+-                roi_data["roi_rect"] = list(self.frame_roi_rect)
+-                with open(self.roi_config_file, 'w') as f:
+-                    json.dump(roi_data, f)
+-                self.log_message("ROI configuration saved (frame coords)")
+-        except Exception as e:
+-            self.log_message(f"Failed to save ROI config: {str(e)}")
+     

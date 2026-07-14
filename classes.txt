@@ -1,0 +1,87 @@
+33: # Import các class và function từ pca_robot.py
+34: class PoseEstimation:
+36: def __init__(self, center: np.ndarray, axes: np.ndarray, rotation_matrix: np.ndarray):
+41: class CameraInfo(NamedTuple):
+55: def draw_mask_overlay(image_bgr: np.ndarray, mask_bool: np.ndarray, color=(0, 255, 0), alpha: float = 0.35):
+73: def numpy_pca(points: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+86: def estimate_pose_with_pca(point_cloud) -> PoseEstimation:
+202: def create_point_cloud_from_depth_image(depth: np.ndarray, camera: CameraInfo, organized: bool = True):
+223: def build_point_cloud_from_detection(
+262: def validate_rt_matrix(RT: np.ndarray) -> bool:
+286: def calculate_grasp_offset(pose: PoseEstimation, grasp_type: str = "center") -> np.ndarray:
+302: def clamp_rotation_angles(R_euler: np.ndarray, max_rx: float = 15.0, max_ry: float = 180.0, max_rz: float = 180.0) -> Tuple[np.ndarray, List[str]]:
+327: def clamp_desc_pos_angles(desc_pos: List[float], max_rx: float = 15.0, max_ry: float = 180.0, max_rz: float = 180.0) -> Tuple[List[float], List[str]]:
+352: def pose_to_robot_coordinates(pose: PoseEstimation, RT: np.ndarray, grasp_offset: np.ndarray = None) -> Tuple[np.ndarray, np.ndarray]:
+384: class YOLODetectionThread(QThread):
+390: def __init__(self):
+433: def setup_model(self, weights_path: str, confidence: float, iou: float):
+445: # Chấp nhận tất cả các class khai báo trong model
+462: # Tìm class ID cho tên class cụ thể trong model
+463: # Input: class_name - tên class cần tìm
+464: # Output: ID của class hoặc None nếu không tìm thấy
+465: def find_class_id(self, class_name: str):
+466: """Tìm class ID cho tên class cụ thể"""
+481: def setup_camera(self, width: int, height: int, fps: int):
+513: def setup_robot(self, robot_instance, tool: int, user: int):
+533: def load_calibration(self):
+561: def set_roi(self, roi_rect):
+571: def load_saved_roi(self):
+582: def is_detection_in_roi(self, x1, y1, x2, y2):
+608: def sort_detections_by_priority(self, detections, poses, targets):
+635: def ensure_yolov5_repo(self, local_dir: str = "yolov5") -> str:
+644: def add_torch_safe_globals(self, yolov5_dir: str):
+657: def run(self):
+730: # Filter detections by ROI and TOP class only
+745: # self.status_update.emit(f"✓ Accepted detection {i} (class {cls})")
+823: # Tự động xác định grasp_type theo tên class (object1 -> top, object2 -> side)
+1038: def create_depth_visualization(self, depth_mm):
+1056: def stop(self):
+1065: class ROIDrawingLabel(QLabel):
+1070: def __init__(self):
+1088: def mousePressEvent(self, event):
+1112: def mouseMoveEvent(self, event):
+1136: def mouseReleaseEvent(self, event):
+1172: def get_resize_handle(self, pos):
+1197: def get_resize_cursor(self, handle):
+1214: def is_point_in_roi(self, pos):
+1224: def resize_roi(self, pos):
+1247: def move_roi(self, pos):
+1274: def paintEvent(self, event):
+1313: def clear_roi(self):
+1324: class MainWindow(QMainWindow):
+1325: def __init__(self):
+1345: def init_ui(self):
+1558: def create_left_panel(self):
+1737: def create_center_panel(self):
+1826: def create_right_panel(self):
+1965: def setup_connections(self):
+2006: def start_detection(self):
+2086: def stop_detection(self):
+2120: def connect_robot_manual(self):
+2146: def open_gripper(self):
+2161: def close_gripper(self):
+2178: def move_robot(self):
+2230: def execute_move():
+2249: def browse_weights(self):
+2260: def clear_log(self):
+2267: def save_log(self):
+2283: def enable_roi_drawing(self):
+2291: def clear_roi(self):
+2302: def load_roi(self):
+2340: def on_roi_drawn(self, roi_rect):
+2375: def on_roi_updated(self, roi_rect):
+2405: def save_roi(self):
+2417: def update_frame(self, color_frame, depth_frame, poses, targets):
+2488: def update_coordinates(self, coordinates):
+2497: def export_coordinates_to_json(self, coordinates):
+2534: def update_status(self, message):
+2555: def show_error(self, error_message):
+2563: def log_message(self, message):
+2574: def save_roi_config(self):
+2589: def load_roi_config(self):
+2618: def start_camera(self):
+2630: def initialize_camera_for_display(self):
+2705: def update_camera_display(self):
+2773: def update_fps(self):
+2785: def closeEvent(self, event):
+2799: def main():
